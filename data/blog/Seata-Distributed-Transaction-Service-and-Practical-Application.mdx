@@ -1,0 +1,473 @@
+---
+title: Seata Distributed Transaction Service and Practical Application
+date: '2024-9-5'
+tags: ['distributed', 'java', 'database']
+draft: false
+summary: 'As the business continues to evolve, monolithic architectures can no longer meet our needs, and distributed microservice architectures have gradually become the preferred choice for large internet platforms. However, all applications using a distributed microservice architecture must confront a particularly challenging issue: the problem of "distributed transactions.'
+---
+
+随着业务的不断发展，单体架构已经无法满足我们的需求，分布式微服务架构逐渐成为大型互联网平台的首选，但所有使用分布式微服务架构的应用都必须面临一个十分棘手的问题，那就是“分布式事务”问题。  
+  
+在分布式微服务架构中，几乎所有业务操作都需要多个服务协作才能完成。对于其中的某个服务而言，它的数据一致性可以交由其自身数据库事务来保证，但从整个分布式微服务架构来看，其全局数据的一致性却是无法保证的。
+
+[Seata](https://seata.io/zh-cn/) 是一款开源的分布式事务解决方案，致力于提供高性能和简单易用的分布式事务服务。Seata 将为用户提供了 AT、TCC、SAGA 和 XA 事务模式，为用户打造一站式的分布式解决方案。
+
+## AT 模式
+
+###  前提
+
+-   基于支持本地 ACID 事务的关系型数据库。
+-   Java 应用，通过 JDBC 访问数据库。
+
+### 整体机制
+
+两阶段提交协议的演变：
+
+-   一阶段：业务数据和回滚日志记录在同一个本地事务中提交，释放本地锁和连接资源。
+-   二阶段：
+    -   提交异步化，非常快速地完成。
+    -   回滚通过一阶段的回滚日志进行反向补偿。
+
+## 写隔离
+
+-   一阶段本地事务提交前，需要确保先拿到 **全局锁** 。
+-   拿不到 **全局锁** ，不能提交本地事务。
+-   拿 **全局锁** 的尝试被限制在一定范围内，超出范围将放弃，并回滚本地事务，释放本地锁。
+
+以一个示例来说明：
+
+两个全局事务 tx1 和 tx2，分别对 a 表的 m 字段进行更新操作，m 的初始值 1000。
+
+tx1 先开始，开启本地事务，拿到本地锁，更新操作 m = 1000 - 100 = 900。本地事务提交前，先拿到该记录的 **全局锁** ，本地提交释放本地锁。 tx2 后开始，开启本地事务，拿到本地锁，更新操作 m = 900 - 100 = 800。本地事务提交前，尝试拿该记录的 **全局锁** ，tx1 全局提交前，该记录的全局锁被 tx1 持有，tx2 需要重试等待 **全局锁** 。
+
+tx1 二阶段全局提交，释放 **全局锁** 。tx2 拿到 **全局锁** 提交本地事务。
+
+如果 tx1 的二阶段全局回滚，则 tx1 需要重新获取该数据的本地锁，进行反向补偿的更新操作，实现分支的回滚。
+
+此时，如果 tx2 仍在等待该数据的 **全局锁**，同时持有本地锁，则 tx1 的分支回滚会失败。分支的回滚会一直重试，直到 tx2 的 **全局锁** 等锁超时，放弃 **全局锁** 并回滚本地事务释放本地锁，tx1 的分支回滚最终成功。
+
+因为整个过程 **全局锁** 在 tx1 结束前一直是被 tx1 持有的，所以不会发生 **脏写** 的问题。
+
+## 读隔离
+
+在数据库本地事务隔离级别 **读已提交（Read Committed）** 或以上的基础上，Seata（AT 模式）的默认全局隔离级别是 **读未提交（Read Uncommitted）** 。
+
+如果应用在特定场景下，必需要求全局的 **读已提交** ，目前 Seata 的方式是通过 SELECT FOR UPDATE 语句的代理。
+
+SELECT FOR UPDATE 语句的执行会申请 **全局锁** ，如果 **全局锁** 被其他事务持有，则释放本地锁（回滚 SELECT FOR UPDATE 语句的本地执行）并重试。这个过程中，查询是被 block 住的，直到 **全局锁** 拿到，即读取的相关数据是 **已提交** 的，才返回。
+
+出于总体性能上的考虑，Seata 目前的方案并没有对所有 SELECT 语句都进行代理，仅针对 FOR UPDATE 的 SELECT 语句。
+
+## 启动 Seata 服务端
+
+前往 [GitHub 发布页](https://github.com/seata/seata/releases) 下载。
+
+### 修改 `store.mode`
+
+启动包: seata-->conf-->application.yml，修改 `store.mode="db或者redis" ` 
+源码: 根目录-->seata-server-->resources-->application.yml，修改 `store.mode="db或者redis"`
+
+1.5.0以下版本:
+
+启动包: seata-->conf-->file.conf，修改 `store.mode="db或者redis"`
+源码: 根目录-->seata-server-->resources-->file.conf，修改 `store.mode="db或者redis"`
+
+### 修改数据库连接 | redis属性配置
+
+启动包: seata-->conf-->application.example.yml中附带额外配置，将其db|redis相关配置复制至application.yml, 进行修改 `store.db` 或 `store.redis` 相关属性。  
+源码: 根目录-->seata-server-->resources-->application.example.yml 中附带额外配置，将其db | redis 相关配置复制至 application.yml ,进行修改 `store.db` 或 `store.redis` 相关属性。
+
+1.5.0以下版本:
+
+启动包: seata-->conf-->file.conf，修改 `store.db` 或 `store.redis` 相关属性。  
+源码: 根目录-->seata-server-->resources-->file.conf，修改 `store.db` 或 `store.redis` 相关属性。
+
+### 启动
+
+-   源码启动: 执行 ServerApplication.java 的 main 方法
+-   命令启动:  `seata-server.sh -h 127.0.0.1 -p 8091 -m db`
+
+1.5.0以下版本
+
+-   源码启动: 执行Server.java的main方法
+-   命令启动: `seata-server.sh -h 127.0.0.1 -p 8091 -m db -n 1 -e test`
+
+```
+    -h: 注册到注册中心的ip
+    -p: Server rpc 监听端口
+    -m: 全局事务会话信息存储模式，file、db、redis，优先读取启动参数 (Seata-Server 1.3及以上版本支持redis)
+    -n: Server node，多个 Server 时，需区分各自节点，用于生成不同区间的transactionId，以免冲突
+    -e: 多环境配置参考 http://seata.io/en-us/docs/ops/multi-configuration-isolation.html
+```
+
+### 本地测试环境部署
+
+我们需要获取一个名为 config.txt 的文本文件，该文件包含了 Seata 配置的所有参数明细。  
+  
+我们可以通过 `seata/script/config-center` 目录中获取 `config.txt`，然后根据自己需要修改其中的配置
+
+在 `seata/script/config-center/nacos` 目录中，有以下 2 个 Seata 脚本：
+
+-   `nacos-config.py`：python 脚本。
+-  ` nacos-config.sh`：为 Linux 脚本，我们可以在 Windows 下通过 Git 命令，将 `config.txt` 中的 Seata 配置上传到 Nacos 配置中心。
+  
+在 `seata/script/config-center/nacos` 目录下，执行以下命令，将 `config.txt` 中的配置上传到 Nacos 配置中心。
+
+```shell
+sh nacos-config.sh -h 127.0.0.1 -p 8848  -g SEATA_GROUP -u nacos -w nacos
+```
+  
+命令各参数说明如下：
+-   `-h`：Nacos 的 host，默认取值为 `localhost`
+-   `-p`：端口号，默认取值为 `8848`
+-   `-g`：Nacos 配置的分组，默认取值为 `SEATA_GROUP`
+-   `-u`：Nacos 用户名
+-   `-w`：Nacos 密码
+
+#### 验证 Nacos 配置中心
+
+在以上所有步骤完成后，启动 Nacos Server，登录 Nacos 控制台查看”配置管理“列表，可以看到出现了 `config.txt` 的配置信息。
+
+## 电商业务系统集成 Seata
+
+配合项目代码: [Hangqi Li / Spring Cloud Alibaba Mall Demo · JiHu GitLab (jihulab.com)](https://jihulab.com/lihangqi/spring-cloud-alibaba-mall-demo)
+
+### 用例
+
+用户购买商品的业务逻辑。整个业务逻辑由3个微服务提供支持：
+
+-   仓储服务：对给定的商品扣除仓储数量。
+-   订单服务：根据采购需求创建订单。
+-   帐户服务：从用户帐户中扣除余额。
+
+### 编码
+
+> 注意：本案例使用 JDK 为 Alibaba Dragonwell 8，推荐使用。
+
+#### 创建订单（Order）服务
+
+在 MySQL 数据库中，新建一个名为 `seata-order` 的数据库实例，并通过以下 SQL 语句创建 2 张表：`t_order`（订单表）和 `undo_log`（回滚日志表）。
+
+```sql
+-- ----------------------------
+-- Table structure for t_order
+-- ----------------------------
+DROP TABLE IF EXISTS `t_order`;
+CREATE TABLE `t_order` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `user_id` bigint DEFAULT NULL COMMENT '用户id',
+  `product_id` bigint DEFAULT NULL COMMENT '产品id',
+  `count` int DEFAULT NULL COMMENT '数量',
+  `money` decimal(11,0) DEFAULT NULL COMMENT '金额',
+  `status` int DEFAULT NULL COMMENT '订单状态：0：未完成；1：已完结',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=32 DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Table structure for undo_log
+-- ----------------------------
+DROP TABLE IF EXISTS `undo_log`;
+CREATE TABLE `undo_log` (
+  `branch_id` bigint NOT NULL COMMENT 'branch transaction id',
+  `xid` varchar(128) NOT NULL COMMENT 'global transaction id',
+  `context` varchar(128) NOT NULL COMMENT 'undo_log context,such as serialization',
+  `rollback_info` longblob NOT NULL COMMENT 'rollback info',
+  `log_status` int NOT NULL COMMENT '0:normal status,1:defense status',
+  `log_created` datetime(6) NOT NULL COMMENT 'create datetime',
+  `log_modified` datetime(6) NOT NULL COMMENT 'modify datetime',
+  UNIQUE KEY `ux_undo_log` (`xid`,`branch_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 ;
+```
+
+在 `seata-order-8005` 的 Spring Boot 模块下的 `pom.xml` 中有以下关键依赖:
+
+```xml
+<!--nacos 服务注册中心-->  
+<dependency>  
+    <groupId>com.alibaba.cloud</groupId>  
+    <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>  
+    <version>2021.0.4.0</version>  
+    <exclusions>  
+        <exclusion>  
+            <groupId>org.springframework.cloud</groupId>  
+            <artifactId>spring-cloud-starter-netflix-ribbon</artifactId>  
+        </exclusion>  
+    </exclusions>  
+</dependency>  
+  
+<!--引入 seata 依赖-->  
+<dependency>  
+    <groupId>com.alibaba.cloud</groupId>  
+    <artifactId>spring-cloud-starter-alibaba-seata</artifactId>  
+    <version>2021.0.4.0</version>  
+</dependency>  
+  
+<!--SpringCloud ailibaba sentinel -->  
+<dependency>  
+    <groupId>com.alibaba.cloud</groupId>  
+    <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>  
+    <version>2021.0.4.0</version>  
+</dependency>  
+  
+<!--配置中心 nacos-->
+<dependency>  
+    <groupId>com.alibaba.cloud</groupId>  
+    <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>  
+    <version>2021.0.4.0</version>  
+</dependency>
+
+<!--添加 Spring Boot 的监控模块-->  
+<dependency>  
+    <groupId>org.springframework.boot</groupId>  
+    <artifactId>spring-boot-starter-actuator</artifactId>  
+</dependency>
+
+<!--引入 OpenFeign 的依赖-->  
+<dependency>  
+    <groupId>org.springframework.cloud</groupId>  
+    <artifactId>spring-cloud-starter-openfeign</artifactId>  
+</dependency>
+
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-bootstrap</artifactId>
+    <version>3.1.5</version>
+</dependency>
+```
+
+`bootstrap.yml` 配置了 Nacos 认证信息。对于 Seata 来说，Nacos 是一种重要的注册中心实现，`application.yml` 中对数据源、Nacos、Sentinel、Seata 等进行了配置。
+
+在 `entity` 包下，有一个名为 `Order` 的实体类；在 `mapper` 包下，有一个名为 `OrderMapper` 的 Mapper 接口；在 `/resouces/mybatis/mapper` 目录下，有一个名为 `OrderMapper.xml` 的 MyBatis 映射文件，进行按主键删除操作、插入、新建、更新记录操作、按主键查询和更新操作。
+
+在 `services` 包下，有三个接口: `OrderService` & `StorageService` & `AccountService` ，分别用于创建订单数据、对接仓储服务、对接账户服务；还有一个 `impl` 包下的三个类去实现上层包的三个接口。
+
+#### 搭建库存（Storage）服务
+
+在 MySQL 数据库中，新建一个名为 `seata-storage` 的数据库实例，并通过以下 SQL 语句创建 2 张表：`t_storage`（库存表）和 `undo_log`（回滚日志表）。
+
+```sql
+-- ----------------------------
+-- Table structure for t_storage
+-- ----------------------------
+DROP TABLE IF EXISTS `t_storage`;
+CREATE TABLE `t_storage` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `product_id` bigint DEFAULT NULL COMMENT '产品id',
+  `total` int DEFAULT NULL COMMENT '总库存',
+  `used` int DEFAULT NULL COMMENT '已用库存',
+  `residue` int DEFAULT NULL COMMENT '剩余库存',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Records of t_storage
+-- ----------------------------
+INSERT INTO `t_storage` VALUES ('1', '1', '100', '0', '100');
+
+-- Table structure for undo_log
+-- ----------------------------
+DROP TABLE IF EXISTS `undo_log`;
+CREATE TABLE `undo_log` (
+  `branch_id` bigint NOT NULL COMMENT 'branch transaction id',
+  `xid` varchar(128) NOT NULL COMMENT 'global transaction id',
+  `context` varchar(128) NOT NULL COMMENT 'undo_log context,such as serialization',
+  `rollback_info` longblob NOT NULL COMMENT 'rollback info',
+  `log_status` int NOT NULL COMMENT '0:normal status,1:defense status',
+  `log_created` datetime(6) NOT NULL COMMENT 'create datetime',
+  `log_modified` datetime(6) NOT NULL COMMENT 'modify datetime',
+  UNIQUE KEY `ux_undo_log` (`xid`,`branch_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 COMMENT='AT transaction mode undo table';
+```
+
+在 `seata-storage-8006` 的 Spring Boot 模块下的 `pom.xml` 中有的关键依赖与 `seata-order-8005` 相同。
+
+在 `entity` 包下，有一个名为 `Storage` 的实体类；在 `mapper` 包下，有一个名为 `StorageMapper` 的 Mapper 接口；在 `/resouces/mybatis/mapper` 目录下，有一个名为 `StorageMapper.xml` 的 MyBatis 映射文件，进行按产品 Id 检索操作、扣减库存操作。
+
+在 `services` 包下，有一个接口: `StorageService` 用于仓储服务，还有一个 `impl` 包下的 `StorageService` 类去实现该接口。
+
+#### 搭建账户（Account）服务
+
+在 MySQL 数据库中，新建一个名为 `seata-account` 的数据库实例，并通过以下 SQL 语句创建 2 张表：`t_account`（账户表）和 `undo_log`（回滚日志表）。
+
+```sql
+DROP TABLE IF EXISTS `t_account`;
+CREATE TABLE `t_account` (
+  `id` bigint NOT NULL AUTO_INCREMENT COMMENT 'id',
+  `user_id` bigint DEFAULT NULL COMMENT '用户id',
+  `total` decimal(10,0) DEFAULT NULL COMMENT '总额度',
+  `used` decimal(10,0) DEFAULT NULL COMMENT '已用余额',
+  `residue` decimal(10,0) DEFAULT '0' COMMENT '剩余可用额度',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Records of t_account
+-- ----------------------------
+INSERT INTO `t_account` VALUES ('1', '1', '1000', '0', '1000');
+
+-- ----------------------------
+-- Table structure for undo_log
+-- ----------------------------
+DROP TABLE IF EXISTS `undo_log`;
+CREATE TABLE `undo_log` (
+  `branch_id` bigint NOT NULL COMMENT 'branch transaction id',
+  `xid` varchar(128) NOT NULL COMMENT 'global transaction id',
+  `context` varchar(128) NOT NULL COMMENT 'undo_log context,such as serialization',
+  `rollback_info` longblob NOT NULL COMMENT 'rollback info',
+  `log_status` int NOT NULL COMMENT '0:normal status,1:defense status',
+  `log_created` datetime(6) NOT NULL COMMENT 'create datetime',
+  `log_modified` datetime(6) NOT NULL COMMENT 'modify datetime',
+  UNIQUE KEY `ux_undo_log` (`xid`,`branch_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+```
+
+在 `seata-account-8007` 的 Spring Boot 模块下的 `pom.xml` 中有的关键依赖与 `seata-order-8005` 相同。
+
+在 `entity` 包下，有一个名为 `Account` 的实体类；在 `mapper` 包下，有一个名为 `AccountMapper` 的 Mapper 接口；在 `/resouces/mybatis/mapper` 目录下，有一个名为 `AccountMapper.xml` 的 MyBatis 映射文件，进行按用户 Id 检索、扣减账户余额操作。
+
+在 `services` 包下，有一个接口: `AccountService` 用于扣减账户余额，还有一个 `impl` 包下的 `AccountServiceImpl` 类去实现该接口。
+
+### 测试
+
+首先启动 Nacos 和 Sentinel, 启动 Seata 服务端并整合 Nacos 配置中心: 修改 `seata/script/config-center` 目录中的 `config.txt`，将 `service.vgroupMapping.{my-service-group}=default` 中的 `{my-service-group}` 更改为 `service-order-group` 。删除有关 `store.db` 和 `store.redis` 的配置，我们使用 `store.file` 。
+
+在目录 `seata/conf` 下修改 `application.yml` 文件中的 `seata` 配置项:
+
+```yaml
+seata:
+  config:
+    # support: nacos, consul, apollo, zk, etcd3
+    type: nacos
+  registry:
+    # support: nacos, eureka, redis, zk, consul, etcd3, sofa
+    type: nacos
+  store:
+    # support: file 、 db 、 redis
+    mode: file
+```
+
+之后在目录 `seata/script/config-center/nacos`  下运行:
+
+```shell
+sh nacos-config.sh -h 127.0.0.1 -p 8848  -g SEATA_GROUP -u nacos -w nacos
+```
+
+出现以下类似的信息和 Nacos 的配置信息即成功:
+
+```
+=========================================================================
+ Complete initialization parameters,  total-count:82 ,  failure-count:1
+=========================================================================
+```
+
+在 `seata/bin` 目录下启动 Seata : 
+
+```shell
+sh seata-server.sh
+```
+
+然后启动 seata-order-8005，如下控制台输出即表示成功，说明该服务已经成功连接上 Seata Server（TC）。
+
+```
+2022-11-17 20:41:07.730  INFO 22588 --- [)-192.168.137.1] com.zaxxer.hikari.HikariDataSource       : defaultDataSource - Starting...
+2022-11-17 20:41:08.681  INFO 22588 --- [)-192.168.137.1] com.zaxxer.hikari.HikariDataSource       : defaultDataSource - Start completed.
+2022-11-17 20:41:50.709  INFO 22588 --- [eoutChecker_2_1] i.s.c.r.netty.NettyClientChannelManager  : will connect to *.*.*.*:8091
+2022-11-17 20:41:50.711  INFO 22588 --- [eoutChecker_2_1] i.s.core.rpc.netty.NettyPoolableFactory  : NettyPool create channel to transactionRole:RMROLE,address:*.*.*.*:8091,msg:< RegisterRMRequest{resourceIds='null', applicationId='spring-cloud-alibaba-seata-order-8005', transactionServiceGroup='service-order-group'} >
+2022-11-17 20:41:50.732  INFO 22588 --- [eoutChecker_2_1] i.s.c.rpc.netty.RmNettyRemotingClient    : register RM success. client version:1.5.2, server version:1.5.2,channel:[id: 0x6ea350dd, L:/*.*.*.*:55383 - R:/*.*.*.*:8091]
+2022-11-17 20:41:50.732  INFO 22588 --- [eoutChecker_2_1] i.s.core.rpc.netty.NettyPoolableFactory  : register success, cost 16 ms, version:1.5.2,role:RMROLE,channel:[id: 0x6ea350dd, L:/*.*.*.*:55383 - R:/*.*.*.*:8091]
+
+```
+
+启动 seata-storage-8006，当控制台出现类似如上日志时，说明该服务已经成功连接上 Seata Server（TC）。
+ 
+启动 seata-account-8007，当控制台出现类似如上日志时，说明该服务已经成功连接上 Seata Server（TC）。
+
+查看 Nacos 服务列表: 
+ 
+使用浏览器访问 [http://localhost:8005/order/createByAnnotation/1/2/20](http://localhost:8005/order/createByAnnotation/1/2/20)，结果如下: 
+
+```json
+{
+	"code": 200,
+	"message": "订单创建成功",
+	"data": null
+}
+```
+
+SQL 查询 `seata-order` 数据库中的 `t_order` 表，结果如下:
+
+| id | user_id | product_id | count | money | status |
+|---|----------|-------------|--------|--------|---------|
+| 1 |   | 1 | 2 | 20 | 1 |
+
+从上表可以看出，商品库存已经扣减 2 件，仓库中商品储量从 100 件减少到了 98 件。
+
+SQL 查询 `seata-account` 数据库中的 `t_account` 表，结果如下:
+
+| id | user_id | total | used | residue |
+|----|---------|-------|------|---------|
+| 1 | 1 | 1000 | 20 | 980 |
+
+从上表可以看出，账户余额已经扣减，金额从 1000 元减少到了 980 元。
+
+使用浏览器访问 [http://localhost:8005/order/createByAnnotation/1/10/1000](http://localhost:8005/order/createByAnnotation/1/10/1000)，会抛出“账户余额不足！”的运行时异常。因为在本次请求中，用户购买 10 件商品（商品 ID 为 1），商品总价为 1000 元，此时用户账户余额 为 980 元。
+
+再次查询 `t_order`、`t_storage` 和 `t_account` 表会发现: 
+
+-   `t_order`（订单表）：订单服务生成了一条订单数据（id 为 2），但订单状态（status）为未完成（0）；
+-  `t_storage`（库存表）：商品库存已扣减；
+-   `t_account`（账户表）：账户金额不足，账户（Account）服务出现异常，进而导致账户金额并未扣减。
+
+#### `@GlobalTransactional` 注解
+
+在分布式微服务架构中，我们可以使用 Seata 提供的 `@GlobalTransactional` 注解实现分布式事务的开启、管理和控制。  
+  
+当调用 `@GlobalTransaction` 注解的方法时，TM 会先向 TC 注册全局事务，TC 生成一个全局唯一的 XID，返回给 TM。  
+  
+`@GlobalTransactional` 注解既可以在类上使用，也可以在类方法上使用，该注解的使用位置决定了全局事务的范围，具体关系如下：  
+
+-   在类中某个方法使用时，全局事务的范围就是该方法以及它所涉及的所有服务。
+-   在类上使用时，全局事务的范围就是这个类中的所有方法以及这些方法涉及的服务。
+  
+接下来，我们就使用 `@GlobalTransactional` 注解对业务系统进行改造。
+
+在 seata-order-8005 的 controller 包下的 `OrderController` 中，添加一个名为 `createByAnnotation` 的方法:
+
+```java
+/**  
+ * 使用 @GlobalTransactional 注解对分布式事务进行管理  
+ */  
+@GetMapping("/order/createByAnnotation/{productId}/{count}/{money}")  
+@GlobalTransactional(name = "create-order", rollbackFor = Exception.class)  
+public CommonResult createByAnnotation(@PathVariable("productId") Integer productId, @PathVariable("count") Integer count  
+        , @PathVariable("money") BigDecimal money) {  
+    Order order = new Order();  
+    order.setProductId(Integer.valueOf(productId).longValue());  
+    order.setCount(count);  
+    order.setMoney(money);  
+    return orderService.create(order);  
+}
+```
+
+> 从以上代码可以看出，添加的 `createByAnnotation()` 方法与 `create()` 方法无论是参数还是代码逻辑都一摸一样，唯一的不同就是前者标注了 `@GlobalTransactional` 注解。
+
+将数据恢复到浏览器访问 “http://localhost:8005/order/createByAnnotation/1/2/20” 之后。  
+  
+重启订单（Order）服务、库存（Storage）服务和账户（Account）服务，并使用浏览器访问 [http://localhost:8005/order/createByAnnotation/1/10/1000](http://localhost:8005/order/createByAnnotation/1/10/1000) 。抛出运行时异常，异常信息为“账户余额不足！”。
+
+在三个服务的控制台页分别显示了相关的**回滚日志**。再到 MySQL 数据库中，再次查询 `t_order`、`t_storage` 和 `t_account` 表。此时没有出现上次的分布式事务造成的数据不一致问题。
+
+## 总结
+
+用户在某电商系统下单购买了一件商品后，电商系统会执行下 4 步：
+
+1.  调用订单服务创建订单数据
+2.  调用库存服务扣减库存
+3.  调用账户服务扣减账户金额
+4.  最后调用订单服务修改订单状态  
+
+为了保证数据的正确性和一致性，我们必须保证所有这些操作要么全部成功，要么全部失败，否则就可能出现类似于商品库存已扣减，但用户账户资金尚未扣减的情况。各服务自身的事务特性显然是无法实现这一目标的，此时，我们可以通过分布式事务框架来解决这个问题。
+
+Seata 就是这样一个分布式事务处理框架，它是由阿里巴巴和蚂蚁金服共同开源的分布式事务解决方案，能够在微服务架构下提供高性能且简单易用的分布式事务服务。
+
+参考文档: [Seata 快速开始](https://seata.io/zh-cn/docs/user/quickstart.html)
