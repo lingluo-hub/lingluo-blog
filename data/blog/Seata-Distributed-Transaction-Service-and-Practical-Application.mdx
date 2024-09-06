@@ -130,8 +130,6 @@ sh nacos-config.sh -h 127.0.0.1 -p 8848  -g SEATA_GROUP -u nacos -w nacos
 
 ## 电商业务系统集成 Seata
 
-配合项目代码: [Hangqi Li / Spring Cloud Alibaba Mall Demo · JiHu GitLab (jihulab.com)](https://jihulab.com/lihangqi/spring-cloud-alibaba-mall-demo)
-
 ### 用例
 
 用户购买商品的业务逻辑。整个业务逻辑由3个微服务提供支持：
@@ -397,7 +395,7 @@ sh seata-server.sh
 SQL 查询 `seata-order` 数据库中的 `t_order` 表，结果如下:
 
 | id | user_id | product_id | count | money | status |
-|---|----------|-------------|--------|--------|---------|
+|:---:|:---:|:---:|:---:|:---:|:---:|
 | 1 |   | 1 | 2 | 20 | 1 |
 
 从上表可以看出，商品库存已经扣减 2 件，仓库中商品储量从 100 件减少到了 98 件。
@@ -405,7 +403,7 @@ SQL 查询 `seata-order` 数据库中的 `t_order` 表，结果如下:
 SQL 查询 `seata-account` 数据库中的 `t_account` 表，结果如下:
 
 | id | user_id | total | used | residue |
-|----|---------|-------|------|---------|
+|:---:|:---:|:---:|:---:|:---:|
 | 1 | 1 | 1000 | 20 | 980 |
 
 从上表可以看出，账户余额已经扣减，金额从 1000 元减少到了 980 元。
